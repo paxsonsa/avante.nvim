@@ -66,16 +66,31 @@ function M.get_user_message(opts)
   )
 end
 
-function M.is_reasoning_model(model) return model and string.match(model, "^o%d+") ~= nil end
+function M.is_reasoning_model(model)
+  return model and (string.match(model, "^o%d+") ~= nil or string.match(model, "^gpt%-5") ~= nil)
+end
 
 function M.set_allowed_params(provider_conf, request_body)
   if M.is_reasoning_model(provider_conf.model) then
     request_body.temperature = 1
+    if request_body.reasoning_effort then
+      request_body.reasoning = { effort = request_body.reasoning_effort }
+      request_body.reasoning_effort = nil
+    end
   else
     request_body.reasoning_effort = nil
   end
-  -- If max_tokens is set in config, unset max_completion_tokens
-  if request_body.max_tokens then request_body.max_completion_tokens = nil end
+  if request_body.max_tokens then
+    request_body.max_output_tokens = request_body.max_tokens
+    request_body.max_tokens = nil
+  elseif request_body.max_completion_tokens then
+    request_body.max_output_tokens = request_body.max_completion_tokens
+    request_body.max_completion_tokens = nil
+  end
+  if request_body.verbosity then
+    request_body.text = vim.tbl_deep_extend("force", request_body.text or {}, { verbosity = request_body.verbosity })
+    request_body.verbosity = nil
+  end
 end
 
 function M:parse_messages(opts)
@@ -379,7 +394,7 @@ function M.transform_openai_usage(usage)
 end
 
 function M:parse_response(ctx, data_stream, _, opts)
-  if data_stream:match('"%[DONE%]":') or data_stream == "[DONE]" then
+  if data_stream == "[DONE]" then
     self:finish_pending_messages(ctx, opts)
     if ctx.tool_use_list and #ctx.tool_use_list > 0 then
       ctx.tool_use_list = {}
@@ -389,112 +404,77 @@ function M:parse_response(ctx, data_stream, _, opts)
     end
     return
   end
-  local jsn = vim.json.decode(data_stream)
-  if jsn.usage and jsn.usage ~= vim.NIL then
-    if opts.update_tokens_usage then
+  local ok, jsn = pcall(vim.json.decode, data_stream)
+  if not ok then return end
+  if jsn.type == "response.completed" then
+    self:finish_pending_messages(ctx, opts)
+    if opts.update_tokens_usage and jsn.usage then
       local usage = self.transform_openai_usage(jsn.usage)
       if usage then opts.update_tokens_usage(usage) end
     end
-  end
-  if jsn.error and jsn.error ~= vim.NIL then
-    opts.on_stop({ reason = "error", error = vim.inspect(jsn.error) })
-    return
-  end
-  ---@cast jsn AvanteOpenAIChatResponse
-  if not jsn.choices then return end
-  local choice = jsn.choices[1]
-  if not choice then return end
-  local delta = choice.delta
-  if not delta then
-    local provider_conf = Providers.parse_config(self)
-    if provider_conf.model:match("o1") then delta = choice.message end
-  end
-  if not delta then return end
-  if delta.reasoning_content and delta.reasoning_content ~= vim.NIL and delta.reasoning_content ~= "" then
-    if ctx.returned_think_start_tag == nil or not ctx.returned_think_start_tag then
-      ctx.returned_think_start_tag = true
-      if opts.on_chunk then opts.on_chunk("<think>\n") end
-    end
-    ctx.last_think_content = delta.reasoning_content
-    self:add_thinking_message(ctx, delta.reasoning_content, "generating", opts)
-    if opts.on_chunk then opts.on_chunk(delta.reasoning_content) end
-  elseif delta.reasoning and delta.reasoning ~= vim.NIL then
-    if ctx.returned_think_start_tag == nil or not ctx.returned_think_start_tag then
-      ctx.returned_think_start_tag = true
-      if opts.on_chunk then opts.on_chunk("<think>\n") end
-    end
-    ctx.last_think_content = delta.reasoning
-    self:add_thinking_message(ctx, delta.reasoning, "generating", opts)
-    if opts.on_chunk then opts.on_chunk(delta.reasoning) end
-  elseif delta.tool_calls and delta.tool_calls ~= vim.NIL then
-    local choice_index = choice.index or 0
-    for idx, tool_call in ipairs(delta.tool_calls) do
-      --- In Gemini's so-called OpenAI Compatible API, tool_call.index is nil, which is quite absurd! Therefore, a compatibility fix is needed here.
-      if tool_call.index == nil then tool_call.index = choice_index + idx - 1 end
-      if not ctx.tool_use_list then ctx.tool_use_list = {} end
-      if not ctx.tool_use_list[tool_call.index + 1] then
-        if tool_call.index > 0 and ctx.tool_use_list[tool_call.index] then
-          local prev_tool_use = ctx.tool_use_list[tool_call.index]
-          self:add_tool_use_message(ctx, prev_tool_use, "generated", opts)
-        end
-        local tool_use = {
-          name = tool_call["function"].name,
-          id = tool_call.id,
-          input_json = type(tool_call["function"].arguments) == "string" and tool_call["function"].arguments or "",
-        }
-        ctx.tool_use_list[tool_call.index + 1] = tool_use
-        self:add_tool_use_message(ctx, tool_use, "generating", opts)
-      else
-        local tool_use = ctx.tool_use_list[tool_call.index + 1]
-        if tool_call["function"].arguments == vim.NIL then tool_call["function"].arguments = "" end
-        tool_use.input_json = tool_use.input_json .. tool_call["function"].arguments
-        -- self:add_tool_use_message(ctx, tool_use, "generating", opts)
-      end
-    end
-  elseif delta.content then
-    if
-      ctx.returned_think_start_tag ~= nil and (ctx.returned_think_end_tag == nil or not ctx.returned_think_end_tag)
-    then
-      ctx.returned_think_end_tag = true
-      if opts.on_chunk then
-        if ctx.last_think_content and ctx.last_think_content ~= vim.NIL and ctx.last_think_content:sub(-1) ~= "\n" then
-          opts.on_chunk("\n</think>\n")
-        else
-          opts.on_chunk("</think>\n")
-        end
-      end
-      self:add_thinking_message(ctx, "", "generated", opts)
-    end
-    if delta.content ~= vim.NIL then
-      if opts.on_chunk then opts.on_chunk(delta.content) end
-      self:add_text_message(ctx, delta.content, "generating", opts)
-    end
-  end
-  if choice.finish_reason == "stop" or choice.finish_reason == "eos_token" or choice.finish_reason == "length" then
-    self:finish_pending_messages(ctx, opts)
     if ctx.tool_use_list and #ctx.tool_use_list > 0 then
       opts.on_stop({ reason = "tool_use", usage = self.transform_openai_usage(jsn.usage) })
     else
       opts.on_stop({ reason = "complete", usage = self.transform_openai_usage(jsn.usage) })
     end
-  end
-  if choice.finish_reason == "tool_calls" then
-    self:finish_pending_messages(ctx, opts)
-    opts.on_stop({
-      reason = "tool_use",
-      usage = self.transform_openai_usage(jsn.usage),
-    })
+    return
+  elseif jsn.type == "response.output_text.delta" then
+    if opts.on_chunk then opts.on_chunk(jsn.delta) end
+    self:add_text_message(ctx, jsn.delta or "", "generating", opts)
+    return
+  elseif jsn.type == "response.output_text.done" then
+    return
+  elseif jsn.type == "response.reasoning.delta" or jsn.type == "response.reasoning_content.delta" then
+    if ctx.returned_think_start_tag == nil or not ctx.returned_think_start_tag then
+      ctx.returned_think_start_tag = true
+      if opts.on_chunk then opts.on_chunk("<think>\n") end
+    end
+    if opts.on_chunk then opts.on_chunk(jsn.delta) end
+    self:add_thinking_message(ctx, jsn.delta or "", "generating", opts)
+    return
+  elseif jsn.type == "response.reasoning.done" or jsn.type == "response.reasoning_content.done" then
+    if ctx.returned_think_start_tag and not ctx.returned_think_end_tag then
+      ctx.returned_think_end_tag = true
+      if opts.on_chunk then opts.on_chunk("</think>\n") end
+      self:add_thinking_message(ctx, "", "generated", opts)
+    end
+    return
+  elseif jsn.type == "response.function_call.arguments.delta" then
+    local index = jsn.index or 0
+    if not ctx.tool_use_list then ctx.tool_use_list = {} end
+    if not ctx.tool_use_list[index + 1] then
+      local tool_use = {
+        name = jsn.name,
+        id = jsn.id,
+        input_json = jsn.arguments or jsn.delta or "",
+      }
+      ctx.tool_use_list[index + 1] = tool_use
+      self:add_tool_use_message(ctx, tool_use, "generating", opts)
+    else
+      local tool_use = ctx.tool_use_list[index + 1]
+      tool_use.input_json = tool_use.input_json .. (jsn.arguments or jsn.delta or "")
+    end
+    return
+  elseif jsn.type == "response.function_call.arguments.done" then
+    local index = jsn.index or 0
+    if ctx.tool_use_list and ctx.tool_use_list[index + 1] then
+      self:add_tool_use_message(ctx, ctx.tool_use_list[index + 1], "generated", opts)
+    end
+    return
+  elseif jsn.type == "response.error" or jsn.error then
+    opts.on_stop({ reason = "error", error = vim.inspect(jsn.error or jsn) })
+    return
   end
 end
 
 function M:parse_response_without_stream(data, _, opts)
-  ---@type AvanteOpenAIChatResponse
   local json = vim.json.decode(data)
-  if json.choices and json.choices[1] then
-    local choice = json.choices[1]
-    if choice.message and choice.message.content then
-      if opts.on_chunk then opts.on_chunk(choice.message.content) end
-      self:add_text_message({}, choice.message.content, "generated", opts)
+  if json.output and json.output[1] then
+    local msg = json.output[1]
+    if msg.content and msg.content[1] and msg.content[1].text then
+      local text = msg.content[1].text
+      if opts.on_chunk then opts.on_chunk(text) end
+      self:add_text_message({}, text, "generated", opts)
       vim.schedule(function() opts.on_stop({ reason = "complete" }) end)
     end
   end
@@ -541,18 +521,15 @@ function M:parse_curl_args(prompt_opts)
   if use_ReAct_prompt then stop = { "</tool_use>" } end
 
   return {
-    url = Utils.url_join(provider_conf.endpoint, "/chat/completions"),
+    url = Utils.url_join(provider_conf.endpoint, "/responses"),
     proxy = provider_conf.proxy,
     insecure = provider_conf.allow_insecure,
     headers = Utils.tbl_override(headers, self.extra_headers),
     body = vim.tbl_deep_extend("force", {
       model = provider_conf.model,
-      messages = self:parse_messages(prompt_opts),
+      input = self:parse_messages(prompt_opts),
       stop = stop,
       stream = true,
-      stream_options = not M.is_mistral(provider_conf.endpoint) and {
-        include_usage = true,
-      } or nil,
       tools = tools,
     }, request_body),
   }
